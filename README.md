@@ -1,5 +1,5 @@
 # Static Image Recognition Model using Tensorflow Keras Object Detection Training Model 
-
+# Currently, download link for image archive is broken, will fix soon
 ### By Ruhan Shafi
 
 ## Project Goal:
