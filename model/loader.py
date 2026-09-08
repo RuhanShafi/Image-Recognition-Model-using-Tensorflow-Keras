@@ -1,7 +1,7 @@
 import numpy as np
 import tensorflow as tf
 
-CLASS_NAMES = ['Man', 'Boys', 'Woman', 'Girls']
+CLASS_NAMES = ['Boys', 'Girls', 'Man', 'Woman'] # label-index complient with the model's output layer
 IMG_HEIGHT = 180
 IMG_WIDTH = 180
 

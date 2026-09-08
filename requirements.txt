@@ -8,7 +8,7 @@ ipython
 six
 Pillow
 catppuccin
-opencv-python
+opencv-python==4.11.0.86
 PySide6
 PyMuPDF
 

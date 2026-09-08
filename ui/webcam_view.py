@@ -1,58 +1,51 @@
-import cv2
 import sys
+import cv2
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QImage, QPixmap
 
-MAX_PROBE_INDEX = 5          # how many device indices to check on startup
-PREVIEW_INTERVAL_MS = 30     # ~33 fps preview
-PREDICT_EVERY_N_FRAMES = 15  # throttle inference vs. preview
 
 # ---------- Platform-specific tuning ----------
-# Each OS has a different "best" backend and different probe/preview costs:
-#   - Windows: CAP_DSHOW is far faster to fail on missing indices than the
-#     newer CAP_MSMF default, so probing stays snappy.
-#   - macOS: CAP_AVFOUNDATION is the only backend that reliably enumerates
-#     and triggers the OS camera-permission prompt correctly.
-#   - Linux: CAP_V4L2 avoids falling through to FFMPEG (which throws noisy
-#     but harmless errors on out-of-range indices).
 def _detect_platform_config():
     if sys.platform.startswith("win"):
-        return {
-            "backend": cv2.CAP_DSHOW,
-            "max_probe_index": 5,
-            "preview_interval_ms": 30,
-        }
+        return {"backend": cv2.CAP_DSHOW, "max_probe_index": 5, "preview_interval_ms": 30}
     elif sys.platform == "darwin":
-        return {
-            "backend": cv2.CAP_AVFOUNDATION,
-            "max_probe_index": 4,       # macOS rarely exposes >2-3 devices; keep probing cheap
-            "preview_interval_ms": 33,
-        }
-    else:  # Linux and other POSIX
-        return {
-            "backend": cv2.CAP_V4L2,
-            "max_probe_index": 5,
-            "preview_interval_ms": 30,
-        }
+        return {"backend": cv2.CAP_AVFOUNDATION, "max_probe_index": 4, "preview_interval_ms": 33}
+    else:
+        return {"backend": cv2.CAP_V4L2, "max_probe_index": 5, "preview_interval_ms": 30}
 
 
 _PLATFORM_CONFIG = _detect_platform_config()
 CAMERA_BACKEND = _PLATFORM_CONFIG["backend"]
 MAX_PROBE_INDEX = _PLATFORM_CONFIG["max_probe_index"]
 PREVIEW_INTERVAL_MS = _PLATFORM_CONFIG["preview_interval_ms"]
-PREDICT_EVERY_N_FRAMES = 15  # throttle inference vs. preview; same across platforms
+PREDICT_EVERY_N_FRAMES = 15  # throttle classifier calls vs. preview fps
+
+# Face detector: bundled with opencv-python, no extra download/dependency
+FACE_CASCADE = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
+
+BOX_COLOR = (166, 227, 161)   # Catppuccin Mocha green, in BGR for cv2 drawing
+TEXT_COLOR = (205, 214, 244)  # Catppuccin Mocha text
 
 
 class WebcamView(QWidget):
-    """Live webcam preview with device selection. Calls on_predict(rgb_frame)
-    periodically while running; caller is responsible for showing the result."""
+    """Live webcam preview with device selection, face detection, and a
+    bounding box overlay showing the classifier's live label + confidence.
+
+    on_predict: callable(rgb_face_crop) -> (label: str, confidence: float)
+    Called periodically (throttled), synchronously, on the UI thread.
+    """
 
     def __init__(self, on_predict, parent=None):
         super().__init__(parent)
         self.on_predict = on_predict
         self.capture = None
         self.frame_count = 0
+
+        self.last_bbox = None          # (x, y, w, h) in frame coordinates
+        self.last_prediction = None    # (label, confidence)
 
         self._build_ui()
         self._populate_devices()
@@ -87,9 +80,6 @@ class WebcamView(QWidget):
     # ---------- Device enumeration ----------
 
     def _populate_devices(self):
-        """Probe indices 0..MAX_PROBE_INDEX-1 using the platform-appropriate
-        backend, keep the ones that actually open. Index 0 (if available) is
-        treated as the system default and selected first."""
         self.device_combo.blockSignals(True)
         self.device_combo.clear()
 
@@ -107,7 +97,6 @@ class WebcamView(QWidget):
         if not found_any:
             self.device_combo.addItem("No camera found", userData=None)
 
-        # Only show the selector when there's an actual choice to make
         show_selector = self.device_combo.count() > 1
         self.camera_label.setVisible(show_selector)
         self.device_combo.setVisible(show_selector)
@@ -128,6 +117,8 @@ class WebcamView(QWidget):
             return
 
         self.frame_count = 0
+        self.last_bbox = None
+        self.last_prediction = None
         self.timer.start(PREVIEW_INTERVAL_MS)
 
     def _stop_camera(self):
@@ -151,11 +142,69 @@ class WebcamView(QWidget):
             return
 
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        self._show_frame(frame_rgb)
+
+        # Detect every frame — Haar cascade is cheap enough for this at
+        # webcam resolution, unlike the classifier itself.
+        self._detect_face(frame_bgr)
 
         self.frame_count += 1
-        if self.frame_count % PREDICT_EVERY_N_FRAMES == 0:
-            self.on_predict(frame_rgb)
+        if self.last_bbox is not None and self.frame_count % PREDICT_EVERY_N_FRAMES == 0:
+            self._run_classifier(frame_rgb)
+
+        self._draw_overlay(frame_rgb)
+        self._show_frame(frame_rgb)
+
+    def _detect_face(self, frame_bgr):
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        faces = FACE_CASCADE.detectMultiScale(
+            gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80)
+        )
+
+        if len(faces) == 0:
+            self.last_bbox = None
+            self.last_prediction = None
+            return
+
+        # Largest detected face — avoids the box jumping between people
+        # if more than one face is in frame.
+        self.last_bbox = max(faces, key=lambda f: f[2] * f[3])
+
+    def _run_classifier(self, frame_rgb):
+        x, y, w, h = self.last_bbox
+        crop = frame_rgb[y:y + h, x:x + w]
+        if crop.size == 0:
+            return
+
+        result = self.on_predict(crop)
+        if result is not None:
+            self.last_prediction = result
+
+    def _draw_overlay(self, frame_rgb):
+        if self.last_bbox is None:
+            return
+
+        x, y, w, h = self.last_bbox
+        cv2.rectangle(frame_rgb, (x, y), (x + w, y + h), BOX_COLOR, 2)
+
+        if self.last_prediction is not None:
+            label, confidence = self.last_prediction
+            text = f"{label} ({confidence:.0%})"
+
+            (text_w, text_h), baseline = cv2.getTextSize(
+                text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
+            )
+            label_y = max(y - 10, text_h + 10)
+
+            cv2.rectangle(
+                frame_rgb,
+                (x, label_y - text_h - baseline - 4),
+                (x + text_w + 8, label_y + baseline - 4),
+                BOX_COLOR, -1
+            )
+            cv2.putText(
+                frame_rgb, text, (x + 4, label_y - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (30, 30, 46), 2  # Mocha crust, for contrast on the green fill
+            )
 
     def _show_frame(self, frame_rgb):
         h, w, ch = frame_rgb.shape
@@ -173,8 +222,6 @@ class WebcamView(QWidget):
         super().closeEvent(event)
 
     def hideEvent(self, event):
-        # Pause capture when the tab/view isn't visible (e.g. user switched to
-        # Static Image), so we're not holding the device or burning CPU idly.
         self.timer.stop()
         super().hideEvent(event)
 

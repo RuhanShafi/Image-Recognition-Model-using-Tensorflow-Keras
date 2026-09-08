@@ -84,9 +84,9 @@ class MainWindow(QMainWindow):
 
     def _run_prediction(self, image):
         if self.predictor is None:
-            return
+            return None
         label, confidence = self.predictor.predict(image)
-        print(f"{label} ({confidence:.2%})")
+        return label, confidence
 
 
 if __name__ == "__main__":
