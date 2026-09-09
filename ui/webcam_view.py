@@ -1,4 +1,6 @@
 import sys
+from collections import deque, Counter
+
 import cv2
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox
 from PySide6.QtCore import Qt, QTimer
@@ -19,20 +21,23 @@ _PLATFORM_CONFIG = _detect_platform_config()
 CAMERA_BACKEND = _PLATFORM_CONFIG["backend"]
 MAX_PROBE_INDEX = _PLATFORM_CONFIG["max_probe_index"]
 PREVIEW_INTERVAL_MS = _PLATFORM_CONFIG["preview_interval_ms"]
-PREDICT_EVERY_N_FRAMES = 15  # throttle classifier calls vs. preview fps
+PREDICT_EVERY_N_FRAMES = 15       # throttle classifier calls vs. preview fps
+PREDICTION_HISTORY_LEN = 7        # rolling window for smoothing (~3.5s at current throttle)
+CONFIDENCE_THRESHOLD = 0.55       # below this, show "Uncertain" instead of a label
+FACE_CROP_PADDING = 0.15          # extra margin around Haar box, as a fraction of w/h
 
-# Face detector: bundled with opencv-python, no extra download/dependency
 FACE_CASCADE = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 )
 
-BOX_COLOR = (166, 227, 161)   # Catppuccin Mocha green, in BGR for cv2 drawing
-TEXT_COLOR = (205, 214, 244)  # Catppuccin Mocha text
+BOX_COLOR = (166, 227, 161)   # Catppuccin Mocha green, BGR for cv2 drawing
+UNCERTAIN_BOX_COLOR = (137, 180, 250)  # Mocha blue, used when below confidence threshold
+TEXT_BG_COLOR = (30, 30, 46)  # Mocha crust
 
 
 class WebcamView(QWidget):
     """Live webcam preview with device selection, face detection, and a
-    bounding box overlay showing the classifier's live label + confidence.
+    bounding box overlay showing a temporally-smoothed prediction.
 
     on_predict: callable(rgb_face_crop) -> (label: str, confidence: float)
     Called periodically (throttled), synchronously, on the UI thread.
@@ -44,8 +49,9 @@ class WebcamView(QWidget):
         self.capture = None
         self.frame_count = 0
 
-        self.last_bbox = None          # (x, y, w, h) in frame coordinates
-        self.last_prediction = None    # (label, confidence)
+        self.last_bbox = None
+        self.prediction_history = deque(maxlen=PREDICTION_HISTORY_LEN)
+        self.last_prediction = None  # (label, confidence, is_confident)
 
         self._build_ui()
         self._populate_devices()
@@ -118,6 +124,7 @@ class WebcamView(QWidget):
 
         self.frame_count = 0
         self.last_bbox = None
+        self.prediction_history.clear()
         self.last_prediction = None
         self.timer.start(PREVIEW_INTERVAL_MS)
 
@@ -143,8 +150,6 @@ class WebcamView(QWidget):
 
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
-        # Detect every frame — Haar cascade is cheap enough for this at
-        # webcam resolution, unlike the classifier itself.
         self._detect_face(frame_bgr)
 
         self.frame_count += 1
@@ -162,49 +167,84 @@ class WebcamView(QWidget):
 
         if len(faces) == 0:
             self.last_bbox = None
+            self.prediction_history.clear()
             self.last_prediction = None
             return
 
-        # Largest detected face — avoids the box jumping between people
-        # if more than one face is in frame.
         self.last_bbox = max(faces, key=lambda f: f[2] * f[3])
 
+    def _padded_crop(self, frame_rgb, bbox):
+        """Expand the Haar box by FACE_CROP_PADDING before cropping, so the
+        classifier sees a framing closer to typical portrait/face-dataset
+        crops rather than a tight Haar rectangle."""
+        x, y, w, h = bbox
+        frame_h, frame_w = frame_rgb.shape[:2]
+
+        pad_w = int(w * FACE_CROP_PADDING)
+        pad_h = int(h * FACE_CROP_PADDING)
+
+        x0 = max(0, x - pad_w)
+        y0 = max(0, y - pad_h)
+        x1 = min(frame_w, x + w + pad_w)
+        y1 = min(frame_h, y + h + pad_h)
+
+        return frame_rgb[y0:y1, x0:x1]
+
     def _run_classifier(self, frame_rgb):
-        x, y, w, h = self.last_bbox
-        crop = frame_rgb[y:y + h, x:x + w]
+        crop = self._padded_crop(frame_rgb, self.last_bbox)
         if crop.size == 0:
             return
 
         result = self.on_predict(crop)
-        if result is not None:
-            self.last_prediction = result
+        if result is None:
+            return
+
+        self.prediction_history.append(result)
+        self.last_prediction = self._smoothed_prediction()
+
+    def _smoothed_prediction(self):
+        """Majority-vote label over the rolling window, averaged confidence
+        for that label, flagged against CONFIDENCE_THRESHOLD."""
+        labels = [label for label, _ in self.prediction_history]
+        majority_label = Counter(labels).most_common(1)[0][0]
+
+        confidences = [c for label, c in self.prediction_history if label == majority_label]
+        avg_confidence = sum(confidences) / len(confidences)
+
+        is_confident = avg_confidence >= CONFIDENCE_THRESHOLD
+        return majority_label, avg_confidence, is_confident
 
     def _draw_overlay(self, frame_rgb):
         if self.last_bbox is None:
             return
 
         x, y, w, h = self.last_bbox
-        cv2.rectangle(frame_rgb, (x, y), (x + w, y + h), BOX_COLOR, 2)
 
         if self.last_prediction is not None:
-            label, confidence = self.last_prediction
-            text = f"{label} ({confidence:.0%})"
+            label, confidence, is_confident = self.last_prediction
+            box_color = BOX_COLOR if is_confident else UNCERTAIN_BOX_COLOR
+            text = f"{label} ({confidence:.0%})" if is_confident else "Uncertain"
+        else:
+            box_color = UNCERTAIN_BOX_COLOR
+            text = "..."
 
-            (text_w, text_h), baseline = cv2.getTextSize(
-                text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
-            )
-            label_y = max(y - 10, text_h + 10)
+        cv2.rectangle(frame_rgb, (x, y), (x + w, y + h), box_color, 2)
 
-            cv2.rectangle(
-                frame_rgb,
-                (x, label_y - text_h - baseline - 4),
-                (x + text_w + 8, label_y + baseline - 4),
-                BOX_COLOR, -1
-            )
-            cv2.putText(
-                frame_rgb, text, (x + 4, label_y - 4),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (30, 30, 46), 2  # Mocha crust, for contrast on the green fill
-            )
+        (text_w, text_h), baseline = cv2.getTextSize(
+            text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
+        )
+        label_y = max(y - 10, text_h + 10)
+
+        cv2.rectangle(
+            frame_rgb,
+            (x, label_y - text_h - baseline - 4),
+            (x + text_w + 8, label_y + baseline - 4),
+            box_color, -1
+        )
+        cv2.putText(
+            frame_rgb, text, (x + 4, label_y - 4),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, TEXT_BG_COLOR, 2
+        )
 
     def _show_frame(self, frame_rgb):
         h, w, ch = frame_rgb.shape
