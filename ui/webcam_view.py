@@ -21,12 +21,12 @@ _PLATFORM_CONFIG = _detect_platform_config()
 CAMERA_BACKEND = _PLATFORM_CONFIG["backend"]
 MAX_PROBE_INDEX = _PLATFORM_CONFIG["max_probe_index"]
 PREVIEW_INTERVAL_MS = _PLATFORM_CONFIG["preview_interval_ms"]
-PREDICT_EVERY_N_FRAMES = 15        # throttle classifier calls vs. preview fps
+PREDICT_EVERY_N_FRAMES = 24        # throttle classifier calls vs. preview fps
 PREDICTION_HISTORY_LEN = 7         # rolling window per tracked face, for smoothing
 CONFIDENCE_THRESHOLD = 0.55        # below this, show "Uncertain" instead of a label
 FACE_CROP_PADDING = 0.15           # extra margin around each Haar box, as a fraction of w/h
 MATCH_IOU_THRESHOLD = 0.3          # min overlap to treat a detection as "the same person"
-MAX_MISSED_FRAMES = 10             # frames a tracked face can go undetected before being dropped
+MAX_MISSED_FRAMES = 24             # frames a tracked face can go undetected before being dropped
 
 FACE_CASCADE = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
